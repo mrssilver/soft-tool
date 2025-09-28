@@ -1,0 +1,521 @@
+package main
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode"
+)
+
+// 函数标识结构体
+type Function struct {
+	Name     string // 函数名
+	Receiver string // 接收器类型（方法专属）
+	Package  string // 所属包名
+}
+
+// 调用关系图
+type CallGraph struct {
+	Nodes map[Function]bool
+	Edges map[Function]map[Function]bool
+}
+
+func NewCallGraph() *CallGraph {
+	return &CallGraph{
+		Nodes: make(map[Function]bool),
+		Edges: make(map[Function]map[Function]bool),
+	}
+}
+
+func (cg *CallGraph) AddNode(fn Function) {
+	cg.Nodes[fn] = true
+}
+
+func (cg *CallGraph) AddEdge(from, to Function) {
+	if cg.Edges[from] == nil {
+		cg.Edges[from] = make(map[Function]bool)
+	}
+	cg.Edges[from][to] = true
+}
+
+// 主函数
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go <directory>")
+		os.Exit(1)
+	}
+
+	dir := os.Args[1]
+	graph := NewCallGraph()
+
+	// 递归解析目录
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// 跳过测试文件和目录
+		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		processFile(path, graph)
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("Error walking directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 生成 Graphviz DOT 格式
+	generateDot(graph)
+}
+
+func processFile(path string, graph *CallGraph) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
+	if err != nil {
+		fmt.Printf("Error parsing file %s: %v\n", path, err)
+		return
+	}
+
+	// 当前包名
+	pkg := file.Name.Name
+
+	// 收集当前文件的所有函数声明
+	funcDecls := make(map[string]*ast.FuncDecl)
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			funcName := fn.Name.Name
+			funcDecls[funcName] = fn
+		}
+	}
+
+	// 分析函数调用关系
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			analyzeFunction(fn, pkg, funcDecls, graph)
+		}
+	}
+}
+
+func analyzeFunction(fn *ast.FuncDecl, pkg string, funcDecls map[string]*ast.FuncDecl, graph *CallGraph) {
+	// 创建当前函数节点
+	fromNode := Function{
+		Package: pkg,
+		Name:    fn.Name.Name,
+	}
+	if fn.Recv != nil {
+		// 处理接收器类型
+		recv := fn.Recv.List[0].Type
+		if star, ok := recv.(*ast.StarExpr); ok {
+			fromNode.Receiver = fmt.Sprintf("*%s", exprToString(star.X))
+		} else {
+			fromNode.Receiver = exprToString(recv)
+		}
+	}
+	graph.AddNode(fromNode)
+
+	// 遍历函数体
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		// 解析被调用函数
+		toNode := parseCallExpr(call, pkg, funcDecls)
+		if toNode.Name != "" {
+			graph.AddNode(toNode)
+			graph.AddEdge(fromNode, toNode)
+		}
+
+		return true
+	})
+}
+
+func parseCallExpr(call *ast.CallExpr, pkg string, funcDecls map[string]*ast.FuncDecl) Function {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		// 普通函数调用
+		if _, exists := funcDecls[fn.Name]; exists {
+			return Function{Package: pkg, Name: fn.Name}
+		}
+	case *ast.SelectorExpr:
+		// 方法调用或包函数调用
+		if ident, ok := fn.X.(*ast.Ident); ok {
+			// 方法调用
+			if _, exists := funcDecls[fn.Sel.Name]; exists {
+				return Function{
+					Package:  pkg,
+					Receiver: ident.Name,
+					Name:     fn.Sel.Name,
+				}
+			}
+		}
+	}
+	return Function{}
+}
+
+func exprToString(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return exprToString(e.X) + "." + e.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func generateDot(graph *CallGraph) {
+	fmt.Println("digraph G {")
+	fmt.Println("  node [shape=box, style=filled];")
+	fmt.Println("  edge [arrowsize=0.8];")
+	fmt.Println()
+
+	// 输出节点
+	for node := range graph.Nodes {
+		label := node.Name
+		if node.Receiver != "" {
+			label = fmt.Sprintf("(%s).%s", node.Receiver, node.Name)
+		}
+		
+		// 根据函数名首字母大小写设置不同颜色
+		fillColor := "orange" // 默认蓝色（小写开头）
+		if len(node.Name) > 0 && unicode.IsUpper(rune(node.Name[0])) {
+			fillColor = "lightcoral" // 大写开头用红色
+		}
+		
+		fmt.Printf("  \"%s\" [label=\"%s\", fillcolor=\"%s\"];\n", node, label, fillColor)
+	}
+
+	fmt.Println()
+
+	// 输出边
+	for from, tos := range graph.Edges {
+		for to := range tos {
+			fmt.Printf("  \"%s\" -> \"%s\";\n", from, to)
+		}
+	}
+
+	fmt.Println("}")
+}
+
+
+主要修改：
+
+1. 在 generateDot 函数中添加了颜色判断逻辑：
+
+// 根据函数名首字母大小写设置不同颜色
+fillColor := "orange" // 默认蓝色（小写开头）
+if len(node.Name) > 0 && unicode.IsUpper(rune(node.Name[0])) {
+    fillColor = "lightcoral" // 大写开头用红色
+}
+
+
+2. 添加了 unicode 包导入：
+
+"unicode"
+
+
+3. 更新了节点输出语句，包含颜色属性：
+
+fmt.Printf("  \"%s\" [label=\"%s\", fillcolor=\"%s\"];\n", node, label, fillColor)
+
+
+效果说明：
+
+• 大写开头的函数（导出的公共函数）：显示为红色节点（lightcoral）
+
+• 小写开头的函数（非导出的私有函数）：显示为蓝色节点（orange）
+
+使用方式不变：
+
+go run main.go /path/to/your/gocode > callgraph.dot
+dot -Tpng -o callgraph.png callgraph.dot
+
+
+这样生成的调用关系图中，公共函数会以红色突出显示，私有函数保持蓝色，使图形更加直观地区分函数的可见性。
+
+
+
+
+
+以下是使用 Go 递归读取代码并生成函数调用关系的 Graphviz 可视化方案：
+
+解决方案思路
+
+1. 解析 Go 源码：使用 go/parser 和 go/ast 包解析源码文件
+
+2. 递归遍历目录：处理所有 .go 文件（排除测试文件）
+
+3. 构建调用关系图：
+
+  ◦ 收集所有函数/方法声明
+
+  ◦ 分析函数体内的调用关系
+
+  ◦ 记录函数间的调用关系
+
+4. 生成 Graphviz DOT 格式：输出函数调用关系图
+
+完整代码实现
+
+package main
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// 函数标识结构体
+type Function struct {
+	Name     string // 函数名
+	Receiver string // 接收器类型（方法专属）
+	Package  string // 所属包名
+}
+
+// 调用关系图
+type CallGraph struct {
+	Nodes map[Function]bool
+	Edges map[Function]map[Function]bool
+}
+
+func NewCallGraph() *CallGraph {
+	return &CallGraph{
+		Nodes: make(map[Function]bool),
+		Edges: make(map[Function]map[Function]bool),
+	}
+}
+
+func (cg *CallGraph) AddNode(fn Function) {
+	cg.Nodes[fn] = true
+}
+
+func (cg *CallGraph) AddEdge(from, to Function) {
+	if cg.Edges[from] == nil {
+		cg.Edges[from] = make(map[Function]bool)
+	}
+	cg.Edges[from][to] = true
+}
+
+// 主函数
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go <directory>")
+		os.Exit(1)
+	}
+
+	dir := os.Args[1]
+	graph := NewCallGraph()
+
+	// 递归解析目录
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// 跳过测试文件和目录
+		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		processFile(path, graph)
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("Error walking directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 生成 Graphviz DOT 格式
+	generateDot(graph)
+}
+
+func processFile(path string, graph *CallGraph) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.AllErrors)
+	if err != nil {
+		fmt.Printf("Error parsing file %s: %v\n", path, err)
+		return
+	}
+
+	// 当前包名
+	pkg := file.Name.Name
+
+	// 收集当前文件的所有函数声明
+	funcDecls := make(map[string]*ast.FuncDecl)
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			funcName := fn.Name.Name
+			funcDecls[funcName] = fn
+		}
+	}
+
+	// 分析函数调用关系
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			analyzeFunction(fn, pkg, funcDecls, graph)
+		}
+	}
+}
+
+func analyzeFunction(fn *ast.FuncDecl, pkg string, funcDecls map[string]*ast.FuncDecl, graph *CallGraph) {
+	// 创建当前函数节点
+	fromNode := Function{
+		Package: pkg,
+		Name:    fn.Name.Name,
+	}
+	if fn.Recv != nil {
+		// 处理接收器类型
+		recv := fn.Recv.List[0].Type
+		if star, ok := recv.(*ast.StarExpr); ok {
+			fromNode.Receiver = fmt.Sprintf("*%s", exprToString(star.X))
+		} else {
+			fromNode.Receiver = exprToString(recv)
+		}
+	}
+	graph.AddNode(fromNode)
+
+	// 遍历函数体
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		// 解析被调用函数
+		toNode := parseCallExpr(call, pkg, funcDecls)
+		if toNode.Name != "" {
+			graph.AddNode(toNode)
+			graph.AddEdge(fromNode, toNode)
+		}
+
+		return true
+	})
+}
+
+func parseCallExpr(call *ast.CallExpr, pkg string, funcDecls map[string]*ast.FuncDecl) Function {
+	switch fn := call.Fun.(type) {
+	case *ast.Ident:
+		// 普通函数调用
+		if _, exists := funcDecls[fn.Name]; exists {
+			return Function{Package: pkg, Name: fn.Name}
+		}
+	case *ast.SelectorExpr:
+		// 方法调用或包函数调用
+		if ident, ok := fn.X.(*ast.Ident); ok {
+			// 方法调用
+			if _, exists := funcDecls[fn.Sel.Name]; exists {
+				return Function{
+					Package:  pkg,
+					Receiver: ident.Name,
+					Name:     fn.Sel.Name,
+				}
+			}
+		}
+	}
+	return Function{}
+}
+
+func exprToString(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return exprToString(e.X) + "." + e.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func generateDot(graph *CallGraph) {
+	fmt.Println("digraph G {")
+	fmt.Println("  node [shape=box, style=filled, fillcolor=orange];")
+	fmt.Println("  edge [arrowsize=0.8];")
+	fmt.Println()
+
+	// 输出节点
+	for node := range graph.Nodes {
+		label := node.Name
+		if node.Receiver != "" {
+			label = fmt.Sprintf("(%s).%s", node.Receiver, node.Name)
+		}
+		fmt.Printf("  \"%s\" [label=\"%s\"];\n", node, label)
+	}
+
+	fmt.Println()
+
+	// 输出边
+	for from, tos := range graph.Edges {
+		for to := range tos {
+			fmt.Printf("  \"%s\" -> \"%s\";\n", from, to)
+		}
+	}
+
+	fmt.Println("}")
+}
+
+
+
+1. 将代码保存为 main.go
+
+2. 运行命令分析指定目录：
+
+go run main.go /path/to/your/gocode > callgraph.dot
+
+
+3. 使用 Graphviz 生成图像：
+
+dot -Tpng -o callgraph.png callgraph.dot
+
+
+功能特点
+
+1. 递归目录扫描：自动处理所有子目录中的 Go 文件
+
+2. 智能识别：
+
+  ◦ 普通函数调用
+
+  ◦ 结构体方法调用
+
+  ◦ 指针接收器方法
+
+3. 排除测试文件：自动忽略 _test.go 文件
+
+4. 清晰可视化：
+
+  ◦ 矩形节点表示函数
+
+  ◦ 箭头表示调用关系
+
+  ◦ 接收器类型显示在方法名前
+
+输出示例 (DOT 格式)
+
+digraph G {
+  node [shape=box, style=filled, fillcolor=orange];
+  edge [arrowsize=0.8];
+  
+  "main" [label="main"];
+  "(Server).Start" [label="(Server).Start"];
+  "(Server).Stop" [label="(Server).Stop"];
+  
+  "main" -> "(Server).Start";
+  "main" -> "(Server).Stop";
+  "(Server).Start" -> "Logger.Log";
+}
+（导出的函数）显示为红色节点，小写开头的函数显示为orange节点。

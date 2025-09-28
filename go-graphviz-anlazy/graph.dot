@@ -1,0 +1,26 @@
+digraph G {
+  node [shape=box, style=filled];
+  edge [arrowsize=0.8];
+
+  "{analyzeFunction  main}" [label="analyzeFunction", fillcolor="orange"];
+  "{exprToString  main}" [label="exprToString", fillcolor="orange"];
+  "{AddNode graph main}" [label="(graph).AddNode", fillcolor="lightcoral"];
+  "{parseCallExpr  main}" [label="parseCallExpr", fillcolor="orange"];
+  "{AddEdge graph main}" [label="(graph).AddEdge", fillcolor="lightcoral"];
+  "{AddNode *CallGraph main}" [label="(*CallGraph).AddNode", fillcolor="lightcoral"];
+  "{main  main}" [label="main", fillcolor="orange"];
+  "{generateDot  main}" [label="generateDot", fillcolor="orange"];
+  "{NewCallGraph  main}" [label="NewCallGraph", fillcolor="lightcoral"];
+  "{AddEdge *CallGraph main}" [label="(*CallGraph).AddEdge", fillcolor="lightcoral"];
+  "{processFile  main}" [label="processFile", fillcolor="orange"];
+
+  "{main  main}" -> "{processFile  main}";
+  "{main  main}" -> "{generateDot  main}";
+  "{main  main}" -> "{NewCallGraph  main}";
+  "{processFile  main}" -> "{analyzeFunction  main}";
+  "{analyzeFunction  main}" -> "{exprToString  main}";
+  "{analyzeFunction  main}" -> "{AddNode graph main}";
+  "{analyzeFunction  main}" -> "{parseCallExpr  main}";
+  "{analyzeFunction  main}" -> "{AddEdge graph main}";
+  "{exprToString  main}" -> "{exprToString  main}";
+}
